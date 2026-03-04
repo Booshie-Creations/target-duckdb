@@ -21,41 +21,11 @@ def camelize(string: str, uppercase_first_letter: bool = True) -> str:
 
 # pylint: disable=fixme
 def column_type(schema_property):
-    property_type = schema_property["type"]
-    property_format = schema_property["format"] if "format" in schema_property else None
-    col_type = "varchar"
-    if "object" in property_type or "array" in property_type:
-        col_type = "json"
-
-    # Every date-time JSON value is currently mapped to TIMESTAMP (no time zone)
-    elif property_format == "date-time":
-        col_type = "timestamp"
-    elif property_format == "time":
-        col_type = "time"
-    elif property_format == "date":
-        col_type = "date"
-    elif "number" in property_type:
-        col_type = "double"
-    elif "integer" in property_type and "string" in property_type:
-        col_type = "varchar"
-    elif "integer" in property_type:
-        if "maximum" in schema_property:
-            if schema_property["maximum"] <= 32767:
-                col_type = "smallint"
-            elif schema_property["maximum"] <= 2147483647:
-                col_type = "integer"
-            elif schema_property["maximum"] <= 9223372036854775807:
-                col_type = "bigint"
-        else:
-            col_type = "hugeint"
-    elif "boolean" in property_type:
-        col_type = "boolean"
-
-    get_logger("target_duckdb").debug(
-        "schema_property: %s -> col_type: %s", schema_property, col_type
-    )
-
-    return col_type
+    # Always use varchar to avoid type mismatches that destroy historical data.
+    # Without this, schema evolution renames existing VARCHAR columns when the
+    # Singer tap reports them as TIMESTAMP, nullifying all historical values.
+    # dbt staging models handle all type casting explicitly.
+    return "varchar"
 
 
 def safe_column_name(name):
@@ -373,28 +343,85 @@ class DbSync:
 
         cur = self.conn
         temp_table = self.table_name(stream_schema_message["stream"], is_temporary=True)
-        temp_file_csv = os.path.join(temp_dir, f"{temp_table}.csv")
-        cur.execute(self.create_table_query(table_name=temp_table, is_temporary=True))
 
-        # batch the records into a CSV file and do a copy operation
-        with open(temp_file_csv, "w") as f:
-            csvwriter = csv.writer(
-                f,
-                delimiter=self.delimiter,
-                quotechar=self.quotechar,
-                quoting=csv.QUOTE_MINIMAL,
+        # Create temp table with ALL VARCHAR columns to avoid type conflicts
+        col_names = self.column_names()
+        varchar_cols = ", ".join([f"{c} VARCHAR" for c in col_names])
+        cur.execute(f"CREATE TEMP TABLE {temp_table} ({varchar_cols})")
+
+        # Use parameterized INSERT
+        placeholders = ", ".join(["?"] * len(col_names))
+        insert_sql = "INSERT INTO {} VALUES ({})".format(temp_table, placeholders)
+
+        batch = []
+        for record in records:
+            row = self.record_to_flattened(record)
+            cleaned = []
+            for val in row:
+                if val is None:
+                    cleaned.append(None)
+                elif isinstance(val, (dict, list)):
+                    import json as _json
+                    cleaned.append(_json.dumps(val))
+                else:
+                    cleaned.append(str(val))
+            batch.append(cleaned)
+
+            if len(batch) >= 1000:
+                cur.executemany(insert_sql, batch)
+                batch = []
+
+        if batch:
+            cur.executemany(insert_sql, batch)
+
+        # Build cast expressions: temp table is all VARCHAR, target may have
+        # typed columns (JSON, HUGEINT, etc). Use TRY_CAST for safe conversion.
+        col_types = self.column_types()
+        cast_cols = []
+        for name, ctype in zip(col_names, col_types):
+            # VARCHAR stays as-is, others get TRY_CAST
+            if ctype.upper() == "VARCHAR" or ctype.upper() == "TEXT":
+                cast_cols.append(f"s.{name}")
+            else:
+                cast_cols.append(f"TRY_CAST(s.{name} AS {ctype}) AS {name}")
+        cast_select = ", ".join(cast_cols)
+
+        table = self.table_name(stream_schema_message["stream"])
+        if len(stream_schema_message["key_properties"]) > 0:
+            # UPDATE existing rows from temp table
+            pk_cols = set(primary_column_names(stream_schema_message))
+            update_cols = [c for c in col_names if c not in pk_cols]
+            if update_cols:
+                update_sets = []
+                for c in update_cols:
+                    idx = col_names.index(c)
+                    ct = col_types[idx]
+                    if ct.upper() in ("VARCHAR", "TEXT"):
+                        update_sets.append(f"{c}=t.{c}")
+                    else:
+                        update_sets.append(f"{c}=TRY_CAST(t.{c} AS {ct})")
+                pk_conds = " AND ".join([f"s.{c}=t.{c}" for c in pk_cols])
+                update_sql = "UPDATE {} AS s SET {} FROM {} t WHERE {}".format(
+                    table, ", ".join(update_sets), temp_table, pk_conds
+                )
+                cur.execute(update_sql)
+
+            # INSERT only rows not already in target
+            pk_join = " AND ".join([f"s.{c}=t.{c}" for c in pk_cols])
+            pk_nulls = " AND ".join([f"t.{c} IS NULL" for c in pk_cols])
+            insert_target_sql = "INSERT INTO {} ({}) (SELECT {} FROM {} s LEFT OUTER JOIN {} t ON {} WHERE {})".format(
+                table, ", ".join(col_names), cast_select, temp_table, table, pk_join, pk_nulls
             )
-            for record in records:
-                csvwriter.writerow(self.record_to_flattened(record))
-        cur.execute("COPY {} FROM '{}' WITH (HEADER false, new_line '\\r\\n')".format(temp_table, temp_file_csv))
+            cur.execute(insert_target_sql)
+        else:
+            # No primary key — just insert all rows with casting
+            insert_target_sql = "INSERT INTO {} ({}) (SELECT {} FROM {} s)".format(
+                table, ", ".join(col_names), cast_select, temp_table
+            )
+            cur.execute(insert_target_sql)
 
-        if len(self.stream_schema_message["key_properties"]) > 0:
-            cur.execute(self.update_from_temp_table(temp_table))
-        cur.execute(self.insert_from_temp_table(temp_table))
         cur.execute(f"DROP TABLE {temp_table}")
-        os.unlink(temp_file_csv)
 
-    # pylint: disable=duplicate-string-formatting-argument
     def insert_from_temp_table(self, temp_table):
         stream_schema_message = self.stream_schema_message
         columns = self.column_names()
